@@ -84,6 +84,7 @@ import com.mongodb.client.model.changestream.ChangeStreamDocument;
 import com.mongodb.lang.Nullable;
 
 import com.mongodb.kafka.connect.source.MongoSourceConfig.StartupConfig;
+import com.mongodb.kafka.connect.source.decrypt.PropertyDecrypter;
 import com.mongodb.kafka.connect.source.heartbeat.HeartbeatManager;
 import com.mongodb.kafka.connect.source.producer.SchemaAndValueProducer;
 import com.mongodb.kafka.connect.source.statistics.StatisticsManager;
@@ -127,6 +128,7 @@ final class StartedMongoSourceTask implements AutoCloseable {
   private final MongoSourceConfig sourceConfig;
   private final Map<String, Object> partitionMap;
   private final MongoClient mongoClient;
+  private final MongoClientSettings mongoClientSettings;
   private HeartbeatManager heartbeatManager;
 
   private boolean supportsStartAfter = true;
@@ -143,11 +145,13 @@ final class StartedMongoSourceTask implements AutoCloseable {
       final Supplier<SourceTaskContext> sourceTaskContextAccessor,
       final MongoSourceConfig sourceConfig,
       final MongoClient mongoClient,
+      final MongoClientSettings mongoClientSettings,
       @Nullable final MongoCopyDataManager copyDataManager,
       final StatisticsManager statisticsManager) {
     this.sourceTaskContextAccessor = sourceTaskContextAccessor;
     this.sourceConfig = sourceConfig;
     this.mongoClient = mongoClient;
+    this.mongoClientSettings = mongoClientSettings;
     isRunning = true;
     boolean shouldCopyData = copyDataManager != null;
     if (shouldCopyData) {
@@ -204,6 +208,8 @@ final class StartedMongoSourceTask implements AutoCloseable {
             ? sourceConfig.getBoolean(PUBLISH_FULL_DOCUMENT_ONLY_TOMBSTONE_ON_DELETE_CONFIG)
             : false;
 
+    PropertyDecrypter propertyDecrypter = sourceConfig.getPropertyDecrypter(mongoClientSettings);
+
     SchemaAndValueProducer keySchemaAndValueProducer =
         createKeySchemaAndValueProvider(sourceConfig);
     SchemaAndValueProducer valueSchemaAndValueProducer =
@@ -247,6 +253,10 @@ final class StartedMongoSourceTask implements AutoCloseable {
                   if (valueDoc instanceof RawBsonDocument) {
                     int sizeBytes = ((RawBsonDocument) valueDoc).getByteBuffer().limit();
                     statisticsManager.currentStatistics().getMongodbBytesRead().sample(sizeBytes);
+                  }
+
+                  if (propertyDecrypter != null) {
+                    valueDoc = propertyDecrypter.decryptProperties(valueDoc);
                   }
 
                   BsonDocument keyDocument;

@@ -141,16 +141,20 @@ public final class MongoSourceTask extends SourceTask {
                 .getCustomCredential(sourceConfig.originals()));
       }
 
-      if (sourceConfig.getAutoEncryptionConfig() != null) {
+      setServerApi(builder, sourceConfig);
+
+      MongoClientSettings mongoClientSettings = builder.build();
+
+      if (sourceConfig.getClientEncryptionConfig() != null) {
         builder.autoEncryptionSettings(
-            sourceConfig.getAutoEncryptionConfig().buildAutoEncryptionSettings());
+            sourceConfig.getClientEncryptionConfig().buildAutoEncryptionSettings());
       }
 
-      setServerApi(builder, sourceConfig);
+      MongoClientSettings keyVaultClientSettings = builder.build();
 
       mongoClient =
           MongoClients.create(
-              builder.build(),
+              mongoClientSettings,
               getMongoDriverInformation(CONNECTOR_TYPE, sourceConfig.getString(PROVIDER_CONFIG)));
       copyDataManager = shouldCopyData ? new MongoCopyDataManager(sourceConfig, mongoClient) : null;
 
@@ -159,7 +163,12 @@ public final class MongoSourceTask extends SourceTask {
               // It is safer to read the `context` reference each time we need it
               // in case it changes, because there is no
               // documentation stating that it cannot be changed.
-              () -> context, sourceConfig, mongoClient, copyDataManager, statisticsManager);
+              () -> context,
+              sourceConfig,
+              mongoClient,
+              keyVaultClientSettings,
+              copyDataManager,
+              statisticsManager);
     } catch (RuntimeException taskStartingException) {
       //noinspection EmptyTryBlock
       try (StatisticsManager autoCloseableStatisticsManager = statisticsManager;

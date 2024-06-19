@@ -43,7 +43,6 @@ import static java.util.Arrays.asList;
 import static java.util.Collections.emptyList;
 import static java.util.Collections.singletonList;
 import static java.util.Collections.unmodifiableList;
-import static org.apache.kafka.common.config.ConfigDef.Width;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -68,7 +67,9 @@ import org.bson.Document;
 import org.bson.json.JsonWriterSettings;
 
 import com.mongodb.AutoEncryptionSettings;
+import com.mongodb.ClientEncryptionSettings;
 import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
 import com.mongodb.annotations.Immutable;
 import com.mongodb.client.model.Collation;
 import com.mongodb.client.model.changestream.FullDocument;
@@ -76,6 +77,8 @@ import com.mongodb.client.model.changestream.FullDocumentBeforeChange;
 import com.mongodb.lang.Nullable;
 
 import com.mongodb.kafka.connect.source.MongoSourceConfig.StartupConfig.StartupMode;
+import com.mongodb.kafka.connect.source.decrypt.DefaultPropertyDecrypter;
+import com.mongodb.kafka.connect.source.decrypt.PropertyDecrypter;
 import com.mongodb.kafka.connect.source.json.formatter.JsonWriterSettingsProvider;
 import com.mongodb.kafka.connect.source.schema.AvroSchema;
 import com.mongodb.kafka.connect.source.topic.mapping.TopicMapper;
@@ -596,6 +599,19 @@ public class MongoSourceConfig extends AbstractConfig {
       "If true, enables Client Side Field Level Encryption using Automatic Encryption."
           + " Also requires: 'mongodb.crypt.kmsprovider' and 'mongodb.crypt.shared.lib.path'.";
 
+  public static final String CRYPT_PROPERTY_MAPPER_CONFIG = "mongodb.crypt.mapper";
+  private static final String CRYPT_PROPERTY_MAPPER_DISPLAY = "The CSFLE property mapper class";
+  private static final String CRYPT_PROPERTY_MAPPER_DOC =
+      "The class that determines how properties will be decrypted.";
+  private static final String CRYPT_PROPERTY_MAPPER_DEFAULT =
+      "com.mongodb.kafka.connect.source.decrypt.DefaultPropertyDecrypter";
+
+  public static final String CRYPT_PROPERTY_MAP_CONFIG = "mongodb.crypt.property.map";
+  public static final String CRYPT_PROPERTY_MAP_DISPLAY = "The CSFLE properties map";
+  public static final String CRYPT_PROPERTY_MAP_DEFAULT = EMPTY_STRING;
+  public static final String CRYPT_PROPERTY_MAP_DOC =
+      "A JSON object specifying which properties to decrypt in a MongoDB change stream document namespace.";
+
   public static final String CRYPT_KEYVAULT_COLLECTION_NS_CONFIG =
       "mongodb.crypt.keyvault.collection";
   public static final String CRYPT_KEYVAULT_COLLECTION_NS_DISPLAY =
@@ -788,21 +804,28 @@ public class MongoSourceConfig extends AbstractConfig {
 
   @VisibleForTesting(otherwise = PACKAGE)
   @Immutable
-  public static final class AutoEncryptionConfig {
+  public static final class ClientEncryptionConfig {
+    private final Optional<Document> propertyMap;
     private final String keyVaultNamespace;
     private final String kmsProvider;
     private final Optional<Document> kmsProviderConfig;
     private final String cryptSharedLibPath;
 
-    private AutoEncryptionConfig(
+    private ClientEncryptionConfig(
+        Optional<Document> propertyMap,
         String keyVaultNamespace,
         String kmsProvider,
         Optional<Document> kmsProviderConfig,
         String cryptSharedLibPath) {
+      this.propertyMap = assertNotNull(propertyMap);
       this.keyVaultNamespace = assertNotNull(keyVaultNamespace);
       this.kmsProvider = assertNotNull(kmsProvider);
-      this.kmsProviderConfig = kmsProviderConfig;
+      this.kmsProviderConfig = assertNotNull(kmsProviderConfig);
       this.cryptSharedLibPath = assertNotNull(cryptSharedLibPath);
+    }
+
+    public Optional<Document> getPropertyMap() {
+      return propertyMap;
     }
 
     public AutoEncryptionSettings buildAutoEncryptionSettings() {
@@ -819,12 +842,26 @@ public class MongoSourceConfig extends AbstractConfig {
           .extraOptions(extraOptions)
           .build();
     }
+
+    public ClientEncryptionSettings buildClientEncryptionSettings(
+        MongoClientSettings mongoClientSettings) {
+      Map<String, Map<String, Object>> kmsProviders = new HashMap<String, Map<String, Object>>();
+      kmsProviders.put(
+          kmsProvider, kmsProviderConfig.orElse(new Document(new HashMap<String, Object>())));
+
+      return ClientEncryptionSettings.builder()
+          .keyVaultMongoClientSettings(mongoClientSettings)
+          .keyVaultNamespace(keyVaultNamespace)
+          .kmsProviders(kmsProviders)
+          .build();
+    }
   }
 
   private final ConnectionString connectionString;
   private TopicMapper topicMapper;
   @Nullable private StartupConfig startupConfig;
-  @Nullable private AutoEncryptionConfig autoEncryptionConfig;
+  @Nullable private ClientEncryptionConfig clientEncryptionConfig;
+  @Nullable private PropertyDecrypter propertyDecrypter;
 
   public MongoSourceConfig(final Map<?, ?> originals) {
     this(originals, true);
@@ -965,6 +1002,13 @@ public class MongoSourceConfig extends AbstractConfig {
     return topicMapper;
   }
 
+  public PropertyDecrypter getPropertyDecrypter(MongoClientSettings mongoClientSettings) {
+    if (propertyDecrypter == null) {
+      propertyDecrypter = configureInstance(new DefaultPropertyDecrypter(mongoClientSettings));
+    }
+    return propertyDecrypter;
+  }
+
   public JsonWriterSettings getJsonWriterSettings() {
     return createInstance(
             OUTPUT_JSON_FORMATTER_CONFIG,
@@ -1001,8 +1045,8 @@ public class MongoSourceConfig extends AbstractConfig {
   }
 
   @Nullable
-  public AutoEncryptionConfig getAutoEncryptionConfig() {
-    AutoEncryptionConfig result = autoEncryptionConfig;
+  public ClientEncryptionConfig getClientEncryptionConfig() {
+    ClientEncryptionConfig result = clientEncryptionConfig;
     if (result != null) {
       return result;
     }
@@ -1010,6 +1054,8 @@ public class MongoSourceConfig extends AbstractConfig {
     if (!getBoolean(CRYPT_ENABLED_CONFIG)) {
       return null;
     }
+
+    final Optional<Document> propertyMap = documentFromString(getString(CRYPT_PROPERTY_MAP_CONFIG));
 
     final String keyVaultNamespace = getString(CRYPT_KEYVAULT_COLLECTION_NS_CONFIG);
     if (keyVaultNamespace == null || keyVaultNamespace.isEmpty()) {
@@ -1036,9 +1082,9 @@ public class MongoSourceConfig extends AbstractConfig {
           "Automatic Encryption Shared library path must not be null or empty.");
     }
 
-    return autoEncryptionConfig =
-        new AutoEncryptionConfig(
-            keyVaultNamespace, kmsProvider, kmsProviderConfig, cryptSharedLibPath);
+    return clientEncryptionConfig =
+        new ClientEncryptionConfig(
+            propertyMap, keyVaultNamespace, kmsProvider, kmsProviderConfig, cryptSharedLibPath);
   }
 
   private <T extends Configurable> T configureInstance(final T instance) {
@@ -1666,6 +1712,28 @@ public class MongoSourceConfig extends AbstractConfig {
         ++orderInGroup,
         Width.SHORT,
         CRYPT_ENABLED_DISPLAY);
+
+    configDef.define(
+        CRYPT_PROPERTY_MAPPER_CONFIG,
+        Type.STRING,
+        CRYPT_PROPERTY_MAPPER_DEFAULT,
+        Importance.LOW,
+        CRYPT_PROPERTY_MAPPER_DOC,
+        group,
+        ++orderInGroup,
+        Width.SHORT,
+        CRYPT_PROPERTY_MAPPER_DISPLAY);
+
+    configDef.define(
+        CRYPT_PROPERTY_MAP_CONFIG,
+        Type.STRING,
+        CRYPT_PROPERTY_MAP_DEFAULT,
+        Importance.LOW,
+        CRYPT_PROPERTY_MAP_DOC,
+        group,
+        ++orderInGroup,
+        Width.SHORT,
+        CRYPT_PROPERTY_MAP_DISPLAY);
 
     configDef.define(
         CRYPT_SHARED_LIB_PATH_CONFIG,
