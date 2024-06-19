@@ -10,10 +10,15 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.function.Function;
 
+import org.bson.BsonBinaryReader;
 import org.bson.BsonDocument;
 import org.bson.BsonNull;
 import org.bson.BsonValue;
 import org.bson.Document;
+import org.bson.RawBsonDocument;
+import org.bson.codecs.BsonDocumentCodec;
+import org.bson.codecs.DecoderContext;
+import org.bson.io.ByteBufferBsonInput;
 
 import com.mongodb.MongoClientSettings;
 import com.mongodb.annotations.NotThreadSafe;
@@ -63,17 +68,33 @@ public class DefaultPropertyDecrypter implements PropertyDecrypter {
 
   @Override
   public BsonDocument decryptProperties(BsonDocument document) {
+    BsonDocument mutated = null;
+    if (!(document instanceof RawBsonDocument)) {
+      mutated = document;
+    }
+
     for (Entry<String, String> pair : simplePairs.entrySet()) {
       String fieldPath = pair.getKey();
       String decryptedFieldPath = pair.getValue();
 
       BsonValue bsonValue = fieldLookup(fieldPath, document).orElse(new BsonNull());
       if (bsonValue.isBinary()) {
+        if (mutated == null && document instanceof RawBsonDocument) {
+          mutated = cloneAsBsonDocument((RawBsonDocument) document);
+        }
+
         BsonValue decrypted = clientEncryption.decrypt(bsonValue.asBinary());
-        fieldSet(decryptedFieldPath, document, decrypted);
+        fieldSet(decryptedFieldPath, mutated, decrypted);
       }
     }
-    return document;
+    return mutated != null ? mutated : document;
+  }
+
+  private static BsonDocument cloneAsBsonDocument(RawBsonDocument rawBsonDocument) {
+    try (BsonBinaryReader bsonReader =
+        new BsonBinaryReader(new ByteBufferBsonInput(rawBsonDocument.getByteBuffer()))) {
+      return new BsonDocumentCodec().decode(bsonReader, DecoderContext.builder().build());
+    }
   }
 
   private static void fieldSet(

@@ -257,6 +257,7 @@ final class StartedMongoSourceTask implements AutoCloseable {
 
                   if (propertyDecrypter != null) {
                     valueDoc = propertyDecrypter.decryptProperties(valueDoc);
+                    LOGGER.trace("Transformed {} for {}", valueDoc, topicName);
                   }
 
                   BsonDocument keyDocument;
