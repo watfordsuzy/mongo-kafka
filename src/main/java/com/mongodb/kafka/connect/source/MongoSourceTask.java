@@ -141,6 +141,11 @@ public final class MongoSourceTask extends SourceTask {
                 .getCustomCredential(sourceConfig.originals()));
       }
 
+      if (sourceConfig.getAutoEncryptionConfig() != null) {
+        builder.autoEncryptionSettings(
+            sourceConfig.getAutoEncryptionConfig().buildAutoEncryptionSettings());
+      }
+
       setServerApi(builder, sourceConfig);
 
       mongoClient =

@@ -26,6 +26,7 @@ import static com.mongodb.kafka.connect.util.Assertions.assertNotNull;
 import static com.mongodb.kafka.connect.util.Assertions.fail;
 import static com.mongodb.kafka.connect.util.ClassHelper.createInstance;
 import static com.mongodb.kafka.connect.util.ConfigHelper.collationFromJson;
+import static com.mongodb.kafka.connect.util.ConfigHelper.documentFromString;
 import static com.mongodb.kafka.connect.util.ConfigHelper.fullDocumentBeforeChangeFromString;
 import static com.mongodb.kafka.connect.util.ConfigHelper.fullDocumentFromString;
 import static com.mongodb.kafka.connect.util.ConfigHelper.jsonArrayFromString;
@@ -45,6 +46,7 @@ import static java.util.Collections.unmodifiableList;
 import static org.apache.kafka.common.config.ConfigDef.Width;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -58,12 +60,14 @@ import org.apache.kafka.common.config.AbstractConfig;
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.config.ConfigDef.Importance;
 import org.apache.kafka.common.config.ConfigDef.Type;
+import org.apache.kafka.common.config.ConfigDef.Width;
 import org.apache.kafka.common.config.ConfigValue;
 
 import org.bson.BsonTimestamp;
 import org.bson.Document;
 import org.bson.json.JsonWriterSettings;
 
+import com.mongodb.AutoEncryptionSettings;
 import com.mongodb.ConnectionString;
 import com.mongodb.annotations.Immutable;
 import com.mongodb.client.model.Collation;
@@ -585,6 +589,41 @@ public class MongoSourceConfig extends AbstractConfig {
       "Use a custom offset partition name. If blank the default partition name based on the "
           + "connection details will be used.";
 
+  public static final String CRYPT_ENABLED_CONFIG = "mongodb.crypt.enabled";
+  public static final String CRYPT_ENABLED_DISPLAY = "Enable Automatic Encryption (CSFLE)";
+  public static final Boolean CRYPT_ENABLED_DEFAULT = false;
+  public static final String CRYPT_ENABLED_DOC =
+      "If true, enables Client Side Field Level Encryption using Automatic Encryption."
+          + " Also requires: 'mongodb.crypt.kmsprovider' and 'mongodb.crypt.shared.lib.path'.";
+
+  public static final String CRYPT_KEYVAULT_COLLECTION_NS_CONFIG =
+      "mongodb.crypt.keyvault.collection";
+  public static final String CRYPT_KEYVAULT_COLLECTION_NS_DISPLAY =
+      "Key Vault Collection Namespace";
+  public static final String CRYPT_KEYVAULT_COLLECTION_NS_DEFAULT = "encryption.__keyVault";
+  public static final String CRYPT_KEYVAULT_COLLECTION_NS_DOC =
+      "Key Vault collection namespace."
+          + " Defaults to '"
+          + CRYPT_KEYVAULT_COLLECTION_NS_DEFAULT
+          + "'.";
+
+  public static final String CRYPT_KMS_PROVIDER_CONFIG = "mongodb.crypt.kmsprovider";
+  public static final String CRYPT_KMS_PROVIDER_DISPLAY = "KMS provider";
+  public static final String CRYPT_KMS_PROVIDER_DEFAULT = EMPTY_STRING;
+  public static final String CRYPT_KMS_PROVIDER_DOC = "KMS provider name.";
+
+  public static final String CRYPT_KMS_PROVIDER_JSON_CONFIG = "mongodb.crypt.kmsprovider.config";
+  public static final String CRYPT_KMS_PROVIDER_JSON_DISPLAY = "KMS provider JSON configuration";
+  public static final String CRYPT_KMS_PROVIDER_JSON_DEFAULT = EMPTY_STRING;
+  public static final String CRYPT_KMS_PROVIDER_JSON_DOC = "KMS provider JSON configuration.";
+
+  public static final String CRYPT_SHARED_LIB_PATH_CONFIG = "mongodb.crypt.shared.lib.path";
+  public static final String CRYPT_SHARED_LIB_PATH_DISPLAY =
+      "Automatic Encryption Shared Library path";
+  public static final String CRYPT_SHARED_LIB_PATH_DEFAULT = EMPTY_STRING;
+  public static final String CRYPT_SHARED_LIB_PATH_DOC =
+      "Path to theFull path to your Automatic Encryption Shared Library.";
+
   static final String PROVIDER_CONFIG = "provider";
   private CustomCredentialProvider customCredentialProvider;
 
@@ -747,9 +786,45 @@ public class MongoSourceConfig extends AbstractConfig {
     }
   }
 
+  @VisibleForTesting(otherwise = PACKAGE)
+  @Immutable
+  public static final class AutoEncryptionConfig {
+    private final String keyVaultNamespace;
+    private final String kmsProvider;
+    private final Optional<Document> kmsProviderConfig;
+    private final String cryptSharedLibPath;
+
+    private AutoEncryptionConfig(
+        String keyVaultNamespace,
+        String kmsProvider,
+        Optional<Document> kmsProviderConfig,
+        String cryptSharedLibPath) {
+      this.keyVaultNamespace = assertNotNull(keyVaultNamespace);
+      this.kmsProvider = assertNotNull(kmsProvider);
+      this.kmsProviderConfig = kmsProviderConfig;
+      this.cryptSharedLibPath = assertNotNull(cryptSharedLibPath);
+    }
+
+    public AutoEncryptionSettings buildAutoEncryptionSettings() {
+      Map<String, Map<String, Object>> kmsProviders = new HashMap<String, Map<String, Object>>();
+      kmsProviders.put(
+          kmsProvider, kmsProviderConfig.orElse(new Document(new HashMap<String, Object>())));
+
+      Map<String, Object> extraOptions = new HashMap<String, Object>();
+      extraOptions.put("cryptSharedLibPath", cryptSharedLibPath);
+
+      return AutoEncryptionSettings.builder()
+          .keyVaultNamespace(keyVaultNamespace)
+          .kmsProviders(kmsProviders)
+          .extraOptions(extraOptions)
+          .build();
+    }
+  }
+
   private final ConnectionString connectionString;
   private TopicMapper topicMapper;
   @Nullable private StartupConfig startupConfig;
+  @Nullable private AutoEncryptionConfig autoEncryptionConfig;
 
   public MongoSourceConfig(final Map<?, ?> originals) {
     this(originals, true);
@@ -923,6 +998,47 @@ public class MongoSourceConfig extends AbstractConfig {
         AbstractConfig::getString,
         OVERRIDE_ERRORS_DEAD_LETTER_QUEUE_TOPIC_NAME_CONFIG,
         ERRORS_DEAD_LETTER_QUEUE_TOPIC_NAME_CONFIG);
+  }
+
+  @Nullable
+  public AutoEncryptionConfig getAutoEncryptionConfig() {
+    AutoEncryptionConfig result = autoEncryptionConfig;
+    if (result != null) {
+      return result;
+    }
+
+    if (!getBoolean(CRYPT_ENABLED_CONFIG)) {
+      return null;
+    }
+
+    final String keyVaultNamespace = getString(CRYPT_KEYVAULT_COLLECTION_NS_CONFIG);
+    if (keyVaultNamespace == null || keyVaultNamespace.isEmpty()) {
+      throw new ConnectConfigException(
+          CRYPT_KEYVAULT_COLLECTION_NS_CONFIG,
+          null,
+          "Key Vault Collection must not be null or empty.");
+    }
+
+    final String kmsProvider = getString(CRYPT_KMS_PROVIDER_CONFIG);
+    if (kmsProvider == null || kmsProvider.isEmpty()) {
+      throw new ConnectConfigException(
+          CRYPT_KMS_PROVIDER_CONFIG, null, "KMS Provider must not be null or empty.");
+    }
+
+    final Optional<Document> kmsProviderConfig =
+        documentFromString(getString(CRYPT_KMS_PROVIDER_JSON_CONFIG));
+
+    final String cryptSharedLibPath = getString(CRYPT_SHARED_LIB_PATH_CONFIG);
+    if (cryptSharedLibPath == null || cryptSharedLibPath.isEmpty()) {
+      throw new ConnectConfigException(
+          CRYPT_SHARED_LIB_PATH_CONFIG,
+          null,
+          "Automatic Encryption Shared library path must not be null or empty.");
+    }
+
+    return autoEncryptionConfig =
+        new AutoEncryptionConfig(
+            keyVaultNamespace, kmsProvider, kmsProviderConfig, cryptSharedLibPath);
   }
 
   private <T extends Configurable> T configureInstance(final T instance) {
@@ -1536,6 +1652,64 @@ public class MongoSourceConfig extends AbstractConfig {
         ++orderInGroup,
         Width.SHORT,
         OFFSET_PARTITION_NAME_DISPLAY);
+
+    group = "Automatic Encryption";
+    orderInGroup = 0;
+
+    configDef.define(
+        CRYPT_ENABLED_CONFIG,
+        Type.BOOLEAN,
+        CRYPT_ENABLED_DEFAULT,
+        Importance.MEDIUM,
+        CRYPT_ENABLED_DOC,
+        group,
+        ++orderInGroup,
+        Width.SHORT,
+        CRYPT_ENABLED_DISPLAY);
+
+    configDef.define(
+        CRYPT_SHARED_LIB_PATH_CONFIG,
+        Type.STRING,
+        CRYPT_SHARED_LIB_PATH_DEFAULT,
+        Importance.LOW,
+        CRYPT_SHARED_LIB_PATH_DOC,
+        group,
+        ++orderInGroup,
+        Width.SHORT,
+        CRYPT_SHARED_LIB_PATH_DISPLAY);
+
+    configDef.define(
+        CRYPT_KMS_PROVIDER_CONFIG,
+        Type.STRING,
+        CRYPT_KMS_PROVIDER_DEFAULT,
+        Importance.LOW,
+        CRYPT_KMS_PROVIDER_DOC,
+        group,
+        ++orderInGroup,
+        Width.SHORT,
+        CRYPT_KMS_PROVIDER_DISPLAY);
+
+    configDef.define(
+        CRYPT_KMS_PROVIDER_JSON_CONFIG,
+        Type.STRING,
+        CRYPT_KMS_PROVIDER_JSON_DEFAULT,
+        Importance.LOW,
+        CRYPT_KMS_PROVIDER_JSON_DOC,
+        group,
+        ++orderInGroup,
+        Width.SHORT,
+        CRYPT_KMS_PROVIDER_JSON_DISPLAY);
+
+    configDef.define(
+        CRYPT_KEYVAULT_COLLECTION_NS_CONFIG,
+        Type.STRING,
+        CRYPT_KEYVAULT_COLLECTION_NS_DEFAULT,
+        Importance.LOW,
+        CRYPT_KEYVAULT_COLLECTION_NS_DOC,
+        group,
+        ++orderInGroup,
+        Width.SHORT,
+        CRYPT_KEYVAULT_COLLECTION_NS_DISPLAY);
 
     configDef.defineInternal(PROVIDER_CONFIG, Type.STRING, "", Importance.LOW);
 
